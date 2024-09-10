@@ -5,6 +5,61 @@ import logging
 import pathlib
 import re
 import sys
+import requests
+
+
+def get_jira_issue(issue_key, jira_url, jira_email, jira_token):
+    url = f"{jira_url}/rest/api/3/issue/{issue_key}"
+    auth = (jira_email, jira_token)
+    headers = {"Accept": "application/json"}
+
+    try:
+        response = requests.get(url, auth=auth, headers=headers)
+        response.raise_for_status()  # Raise HTTPError for bad responses
+        return response.json()  # Return the full Jira issue JSON response
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred while fetching Jira issue {issue_key}: {http_err}")
+    except Exception as err:
+        logging.error(f"Error occurred while fetching Jira issue {issue_key}: {err}")
+
+    return None
+
+
+def get_parent_epic(jira_issue, jira_url, jira_email, jira_token):
+    # Check if the Jira issue has a parent epic by checking the "parent" field
+    parent_field = jira_issue['fields'].get('parent')
+    
+    if parent_field:
+        epic_key = parent_field['key']  # Get the parent epic's key
+        logging.info(f"Fetching parent epic for issue: {jira_issue['key']}, parent epic key: {epic_key}")
+        epic = get_jira_issue(epic_key, jira_url, jira_email, jira_token)
+
+        if epic:
+            epic_title = epic['fields'].get('summary', 'No title')
+            epic_description = epic['fields'].get('description', 'No description provided')
+
+            # Clean the description (optional, based on need)
+            if isinstance(epic_description, dict) and 'content' in epic_description:
+                content_blocks = epic_description.get('content', [])
+                cleaned_description = []
+                for block in content_blocks:
+                    if block['type'] == 'paragraph':
+                        paragraph_text = " ".join([item.get('text', '') for item in block.get('content', []) if item.get('type') == 'text'])
+                        cleaned_description.append(paragraph_text)
+                epic_description = "\n".join(cleaned_description) if cleaned_description else 'No description available'
+
+            # Cut epic description to a maximum of 300 characters
+            if len(epic_description) > 300:
+                epic_description = epic_description[:300] + "..."
+
+            logging.info(f"Parent epic found: {epic_key} - {epic_title}")
+            return epic_key, epic_title, epic_description
+        else:
+            logging.warning(f"Failed to fetch parent epic details for epic key: {epic_key}")
+    else:
+        logging.warning(f"No parent epic found for issue: {jira_issue['key']}")
+
+    return None, None, None
 
 
 def get_issues_from_pr(github_repo, pr_number):
@@ -18,47 +73,36 @@ def get_issues_from_pr(github_repo, pr_number):
         pass
 
     result = []
+    jira_keys = []
     if issue_body:
-        # Get text in Related Issue section
-        result = re.findall('## Related GitHub Issue(.*)## Related Jira Key', issue_body, re.DOTALL)
+        # Handle both Related GitHub Issue and Related Jira Key
+        result = re.findall(r'## Related GitHub Issue(?:.*?)([A-Za-z0-9-#]+)', issue_body, re.DOTALL)
 
         if not result:
-            result = re.findall('## Related Issue(.*)## Related Jira Key', issue_body, re.DOTALL)
+            result = re.findall(r'## Related Issue(?:.*?)([A-Za-z0-9-#]+)', issue_body, re.DOTALL)
+
+        # Extract Jira keys from the "Related Jira Key" section in the PR body
+        jira_keys = re.findall(r'## Related Jira Key(?:.*?)([A-Z]+-\d+)', issue_body, re.DOTALL)
 
     if result:
-        # Single string list to multi-string list
-        issues = "\n".join(result).split("\n")
+        # Split the extracted string into list items based on newlines 
+        issues = re.split(r'\s*,\s*|\s*\n\s*', "\n".join(result))
     else:
         issues = []
 
-    try:
-        # Remove \r from list entries
-        issues = [s.replace('\r', '') for s in issues]
-    except:
-        issues = []
+    # Clean up issues, remove any unwanted characters
+    issues = [issue.strip() for issue in issues if issue.strip() and issue.strip().lower() not in ["na", "todo"]]
 
-    # Remove empty list entries
-    issues = list(filter(None, issues))
+    # Only keep issues with numeric identifiers
+    issues = [issue for issue in issues if re.search(r'\d+', issue)]
 
     if issues:
-        # Remove NA and TODO from list
-        issues = [s for s in issues if s != "NA" and s != "TODO"]
+        logging.info(f"PR #{pr_number}: found GitHub Issues: {', '.join(sorted(issues))}")
 
-        # Remove entries with no numbers
-        issues = [s for s in issues if any(c.isdigit() for c in s)]
+    if jira_keys:
+        logging.info(f"PR #{pr_number}: found Jira Keys: {', '.join(sorted(jira_keys))}")
 
-        issues = [s.replace(' (mostly)', '') for s in issues]
-
-        issues = [s.strip() for s in issues]
-
-        if issues:
-            logging.info("PR #" + str(pr_number) + ": found " + ", ".join(sorted(issues)))
-            try:
-                issues = [re.findall('\d+$',s.strip())[0] for s in issues]
-            except:
-                pass
-
-    return issues
+    return issues, jira_keys
 
 def get_issue_titles(github_repo, issues):
     issue_titles_bugs = []
@@ -94,16 +138,21 @@ def get_repo_list(github_org, github):
 
 
 def get_repo(repo_name, github):
-    msg_failure = repo_name + ": repo does not exist or bad token"
-
     try:
-        repo = github.get_repo(repo_name)
+        return github.get_repo(repo_name)
     except Exception as e:
-        logging.error(e)
-        logging.error(msg_failure)
+        logging.error(f"{repo_name}: repo does not exist or bad token. Error: {e}")
         sys.exit(1)
 
-    return repo
+def get_release_notes_summary(total_bugs, total_enhancements, total_other, total_commits_missing_issues, total_prs_missing_issues):
+    summary = "\n\n## Summary\n"
+    summary += f"Total Bugs & Anomalies: {total_bugs}\n"
+    summary += f"Total Enhancements: {total_enhancements}\n"
+    summary += f"Total Issues Missing Labels: {total_other}\n"
+    summary += f"Total Commits Missing Issues: {total_commits_missing_issues}\n"
+    summary += f"Total Pull Requests Missing Issues: {total_prs_missing_issues}\n"
+    return summary
+
 
 def get_release_notes(name, version, issue_titles_bugs, issue_titles_enhancements, issue_titles_other, commit_only, pull_requests_missing_issues):
     release_notes = "\n\n## " + name + "\n"
@@ -129,11 +178,21 @@ def get_release_notes(name, version, issue_titles_bugs, issue_titles_enhancement
         release_notes += "\n\n#### Pull Requests Missing Issues\n"
         release_notes += "* " + "\n* ".join(sorted(pull_requests_missing_issues))
 
+    # Summary section
+    total_bugs = len(issue_titles_bugs)
+    total_enhancements = len(issue_titles_enhancements)
+    total_other = len(issue_titles_other)
+    total_commits_missing_issues = len(commit_only)
+    total_prs_missing_issues = len(pull_requests_missing_issues)
+
+    release_notes += get_release_notes_summary(total_bugs, total_enhancements, total_other, total_commits_missing_issues, total_prs_missing_issues)
+
     return release_notes
 
+
+# TODO add blacklisted repo's here before merging this changes to main brnach
 def is_blacklisted_repo(repo_name):
     blacklist = [
-        "usdot-fhwa-stol/carma-cloud",
         "usdot-fhwa-stol/documentation",
         "usdot-fhwa-stol/github_metrics",
         "usdot-fhwa-stol/voices-cda-use-case-scenario-database",
@@ -235,16 +294,29 @@ def release_notes():
                 pull_requests_missing_issues = set()
                 if prr_list:
                     for pr in prr_list:
-                        logging.info('PR number ' +  str(pr.number) )
                         try:
-                            issues = get_issues_from_pr(repo, pr.number)
+                            jira_keys, github_issues = get_issues_from_pr(repo, pr.number)
+                            
+                            # Handle Jira Epics
+                            if jira_keys:
+                                for jira_key in jira_keys:
+                                    jira_issue = get_jira_issue(jira_key, args.jira_url, args.jira_email, args.jira_token)
+                                    if jira_issue:
+                                        epic_key, epic_title, epic_description = get_parent_epic(jira_issue, args.jira_url, args.jira_email, args.jira_token)
+                                        if epic_title:
+                                            issue_titles_enhancements.append(f"{epic_key} - {epic_title}: {epic_description}")
+                                        else:
+                                            pull_requests_missing_issues.add(pr.title.strip() + f" (Pull Request [#{pr.number}]({pr.html_url}))")
 
-                            if issues:
-                                issue_titles_bugs, issue_titles_enhancements, issue_titles_other = get_issue_titles(repo, issues)
+                            # Fallback to GitHub Issues
+                            elif github_issues:
+                                issue_titles_bugs.extend(github_issues)
+
+                            # Fallback to PR description and title
                             else:
                                 pull_requests_missing_issues.add(pr.title.strip() + " (Pull Request [#" + str(pr.number) + "](" + pr.html_url + "))")
-                        except:
-                            logging.warning("Cannot get issue information for pull request "  +  str(pr.number) )
+                        except Exception as e:
+                            logging.warning(f"Cannot get issue information for pull request {pr.number}: {e}")
                 else:
                     logging.warning(github_repo + ": no pull requests found")
 
@@ -267,12 +339,15 @@ def release_notes():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--github-token", required=True)
+    parser.add_argument("--github-token", required=True)  
     parser.add_argument("--release-branch", required=True)
     parser.add_argument("--stable-branch", required=True)
     parser.add_argument("--organizations", nargs="+", required=True)
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--jira-url", required=True)  
+    parser.add_argument("--jira-email", required=True)  
+    parser.add_argument("--jira-token", required=True)
     args = parser.parse_args()
 
     logging.basicConfig(
