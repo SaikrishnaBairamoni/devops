@@ -7,64 +7,48 @@ import re
 import sys
 import requests
 
-
+# Lists to track skipped repositories and PRs
+skipped_repos = []
+skipped_prs = []
+# Function to get Jira issue details based on the Jira key
 def get_jira_issue(issue_key, jira_url, jira_email, jira_token):
     url = f"{jira_url}/rest/api/3/issue/{issue_key}"
     auth = (jira_email, jira_token)
     headers = {"Accept": "application/json"}
-
-    try:
-        response = requests.get(url, auth=auth, headers=headers)
-        response.raise_for_status()  # Raise HTTPError for bad responses
+    response = requests.get(url, auth=auth, headers=headers)
+    if response.status_code == 200:
         return response.json()  # Return the full Jira issue JSON response
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred while fetching Jira issue {issue_key}: {http_err}")
-    except Exception as err:
-        logging.error(f"Error occurred while fetching Jira issue {issue_key}: {err}")
+    else:
+        logging.error(f"Failed to fetch Jira issue {issue_key}: {response.status_code} - {response.text}")
+        return None
 
-    return None
-
+# Function to extract the Jira epic's title and description information 
+def get_epic_details(jira_issue):
+    epic_key = jira_issue['key']  # Capture the Epic key (e.g., C1T-1234 or any other format key)
+    epic_title = jira_issue['fields'].get('summary', 'No title')  # The title of the Jira issue (epic)
+    epic_description = jira_issue['fields'].get('description', 'No description provided')  # The description of the epic
+    
+    # extracting plain text only from description, avoiding any other format information
+    if isinstance(epic_description, dict) and 'content' in epic_description:
+        content_blocks = epic_description.get('content', [])
+        cleaned_description = []
+        for block in content_blocks:
+            if block['type'] == 'paragraph':
+                paragraph_text = " ".join([item.get('text', '') for item in block.get('content', []) if item.get('type') == 'text'])
+                cleaned_description.append(paragraph_text)
+        epic_description = "\n".join(cleaned_description) if cleaned_description else 'No description available'
+    
+    return epic_key, epic_title, epic_description
 
 def get_parent_epic(jira_issue, jira_url, jira_email, jira_token):
-    # Check if the Jira issue has a parent epic by checking the "parent" field
-    parent_field = jira_issue['fields'].get('parent')
-    
-    if parent_field:
-        epic_key = parent_field['key']  # Get the parent epic's key
-        logging.info(f"Fetching parent epic for issue: {jira_issue['key']}, parent epic key: {epic_key}")
-        epic = get_jira_issue(epic_key, jira_url, jira_email, jira_token)
-
-        if epic:
-            epic_title = epic['fields'].get('summary', 'No title')
-            epic_description = epic['fields'].get('description', 'No description provided')
-
-            # Clean the description (optional, based on need)
-            if isinstance(epic_description, dict) and 'content' in epic_description:
-                content_blocks = epic_description.get('content', [])
-                cleaned_description = []
-                for block in content_blocks:
-                    if block['type'] == 'paragraph':
-                        paragraph_text = " ".join([item.get('text', '') for item in block.get('content', []) if item.get('type') == 'text'])
-                        cleaned_description.append(paragraph_text)
-                epic_description = "\n".join(cleaned_description) if cleaned_description else 'No description available'
-
-            # Cut epic description to a maximum of 300 characters
-            if len(epic_description) > 300:
-                epic_description = epic_description[:300] + "..."
-
-            logging.info(f"Parent epic found: {epic_key} - {epic_title}")
-            return epic_key, epic_title, epic_description
-        else:
-            logging.warning(f"Failed to fetch parent epic details for epic key: {epic_key}")
-    else:
-        logging.warning(f"No parent epic found for issue: {jira_issue['key']}")
-
+    parent_key = jira_issue['fields'].get('parent', {}).get('key')
+    if parent_key:
+        parent_epic = get_jira_issue(parent_key, jira_url, jira_email, jira_token)
+        return get_epic_details(parent_epic)
     return None, None, None
-
 
 def get_issues_from_pr(github_repo, pr_number):
     github_pull_request = github_repo.get_pull(pr_number)
-
     # Remove <!-- comments --> from issue body
     try:
         issue_body = re.sub('<!--.*-->', '', github_pull_request.body)
@@ -72,92 +56,48 @@ def get_issues_from_pr(github_repo, pr_number):
         issue_body = ""
         pass
 
-    result = []
     jira_keys = []
+    github_issues = []
+
     if issue_body:
-        # Handle both Related GitHub Issue and Related Jira Key
-        result = re.findall(r'## Related GitHub Issue(?:.*?)([A-Za-z0-9-#]+)', issue_body, re.DOTALL)
+        # Get Jira keys only from the "Related Jira Key" section of PR's
+        jira_key_match = re.findall(r'Related Jira Key.*?(\[.*?\])?\(?([A-Z]+-\d+)\)?', issue_body, re.DOTALL)
+        if jira_key_match:
+            jira_keys = [match[1].strip() for match in jira_key_match if match[1].strip()]
 
-        if not result:
-            result = re.findall(r'## Related Issue(?:.*?)([A-Za-z0-9-#]+)', issue_body, re.DOTALL)
+        # If no Jira keys found, check for GitHub Issues from the "Related GitHub Issue" section
+        if not jira_keys:
+            github_issue_match = re.findall(r'Related GitHub Issue.*?(\[.*?\])?\(?#(\d+)\)?', issue_body, re.DOTALL)
+            if github_issue_match:
+                github_issues = [f"#{match[1].strip()}" for match in github_issue_match if match[1].strip()]
 
-        # Extract Jira keys from the "Related Jira Key" section in the PR body
-        jira_keys = re.findall(r'## Related Jira Key(?:.*?)([A-Z]+-\d+)', issue_body, re.DOTALL)
+        # If neither Jira keys nor GitHub issues are found, use the PR title and description
+        if not jira_keys and not github_issues:
+            jira_keys = [f"PR Title: {github_pull_request.title.strip()}"]
+            github_issues = [f"PR Description: {github_pull_request.body.strip()[:100]}"]  # Trim description for length
 
-    if result:
-        # Split the extracted string into list items based on newlines 
-        issues = re.split(r'\s*,\s*|\s*\n\s*', "\n".join(result))
-    else:
-        issues = []
+    return jira_keys, github_issues
 
-    # Clean up issues, remove any unwanted characters
-    issues = [issue.strip() for issue in issues if issue.strip() and issue.strip().lower() not in ["na", "todo"]]
-
-    # Only keep issues with numeric identifiers
-    issues = [issue for issue in issues if re.search(r'\d+', issue)]
-
-    if issues:
-        logging.info(f"PR #{pr_number}: found GitHub Issues: {', '.join(sorted(issues))}")
-
-    if jira_keys:
-        logging.info(f"PR #{pr_number}: found Jira Keys: {', '.join(sorted(jira_keys))}")
-
-    return issues, jira_keys
-
-def get_issue_titles(github_repo, issues):
-    issue_titles_bugs = []
-    issue_titles_enhancements = []
-    issue_titles_other = []
-
-    for issue in issues:
-        github_issue = github_repo.get_issue(number=int(issue))
-
-        # Get issue's label names
-        issue_labels_names = set()
-        for label in github_issue.labels:
-            issue_labels_names.add(label.name)
-
-        if "enhancement" in issue_labels_names:
-            issue_titles_enhancements = issue_titles_enhancements + [github_issue.title.strip()]
-        elif "anomaly" or "bug" in issue_labels_names:
-            issue_titles_bugs = issue_titles_bugs + [github_issue.title.strip()]
-        else:
-            issue_titles_other = issue_titles_other + [github_issue.title.strip()]
-
-    return issue_titles_bugs, issue_titles_enhancements, issue_titles_other
-
+# Get repository list from GitHub
 def get_repo_list(github_org, github):
     repo_list = []
 
     for repo in github.get_organization(github_org).get_repos():
-        repo_list = repo_list + [repo.full_name]
-
-    repo_list = sorted(repo_list)
-
-    return repo_list
-
+        repo_list.append(repo.full_name)
+    return sorted(repo_list)
 
 def get_repo(repo_name, github):
+    msg_failure = repo_name + ": repo does not exist or bad token"
     try:
-        return github.get_repo(repo_name)
+        repo = github.get_repo(repo_name)
     except Exception as e:
-        logging.error(f"{repo_name}: repo does not exist or bad token. Error: {e}")
+        logging.error(e)
+        logging.error(msg_failure)
         sys.exit(1)
-
-def get_release_notes_summary(total_bugs, total_enhancements, total_other, total_commits_missing_issues, total_prs_missing_issues):
-    summary = "\n\n## Summary\n"
-    summary += f"Total Bugs & Anomalies: {total_bugs}\n"
-    summary += f"Total Enhancements: {total_enhancements}\n"
-    summary += f"Total Issues Missing Labels: {total_other}\n"
-    summary += f"Total Commits Missing Issues: {total_commits_missing_issues}\n"
-    summary += f"Total Pull Requests Missing Issues: {total_prs_missing_issues}\n"
-    return summary
-
+    return repo
 
 def get_release_notes(name, version, issue_titles_bugs, issue_titles_enhancements, issue_titles_other, commit_only, pull_requests_missing_issues):
-    release_notes = "\n\n## " + name + "\n"
-    release_notes += "### " + version
-
+    release_notes = f"\n\n## {name} - {version}\n"
     if issue_titles_bugs:
         release_notes += "\n\n#### Bugs & Anomalies\n"
         release_notes += "* " + "\n* ".join(sorted(set(issue_titles_bugs)))
@@ -167,7 +107,7 @@ def get_release_notes(name, version, issue_titles_bugs, issue_titles_enhancement
         release_notes += "* " + "\n* ".join(sorted(set(issue_titles_enhancements)))
 
     if issue_titles_other:
-        release_notes += "\n\n#### Issues Missing Labels\n"
+        release_notes += "\n\n#### Other Issues\n"
         release_notes += "* " + "\n* ".join(sorted(set(issue_titles_other)))
 
     if commit_only:
@@ -175,21 +115,9 @@ def get_release_notes(name, version, issue_titles_bugs, issue_titles_enhancement
         release_notes += "* " + "\n* ".join(sorted(commit_only))
 
     if pull_requests_missing_issues:
-        release_notes += "\n\n#### Pull Requests Missing Issues\n"
+        release_notes += "\n\n#### PRs Missing Issues\n"
         release_notes += "* " + "\n* ".join(sorted(pull_requests_missing_issues))
-
-    # Summary section
-    total_bugs = len(issue_titles_bugs)
-    total_enhancements = len(issue_titles_enhancements)
-    total_other = len(issue_titles_other)
-    total_commits_missing_issues = len(commit_only)
-    total_prs_missing_issues = len(pull_requests_missing_issues)
-
-    release_notes += get_release_notes_summary(total_bugs, total_enhancements, total_other, total_commits_missing_issues, total_prs_missing_issues)
-
     return release_notes
-
-
 # TODO add blacklisted repo's here before merging this changes to main brnach
 def is_blacklisted_repo(repo_name):
     blacklist = [
@@ -199,15 +127,12 @@ def is_blacklisted_repo(repo_name):
     ]
 
     if repo_name in blacklist:
-        logging.warning(repo_name +
-                        ": blacklisted repository, skipping it")
+        logging.warning(repo_name + ": blacklisted repository, skipping it")
+        skipped_repos.append(repo_name)
         return True
-    else:
-        return False
-
-
+    return False
+# Check if a branch exists in the repo
 def is_branch(branch, repo):
-    # Test branch existence
     branch_exists = False
     try:
         for ref in repo.get_git_refs():
@@ -232,30 +157,16 @@ def release_notes():
             for github_repo in get_repo_list(org, github):
                 logging.info("Processing " + github_repo)
                 repo = get_repo(github_repo, github)
-
-                # Skip archived repos
-                if repo.archived:
-                    logging.warning(
-                        github_repo + ": archived repository, skipping it"
-                    )
+                # Skip archived and blacklisted repos
+                if repo.archived or is_blacklisted_repo(github_repo):
                     continue
-
-                # Skip blacklisted repos
-                if is_blacklisted_repo(github_repo):
-                    continue
-
-                # New branch versus old branch
+                # Compare branches (release or any branches vs. stable )
                 compare_branches = [args.release_branch, args.stable_branch]
-
-
-                # Test branch existence
                 skip = False
                 for branch in compare_branches:
                     if not is_branch(branch, repo):
-                        logging.warning(
-                            github_repo + ": \"" + branch +
-                            "\" branch does not exist, skipping repo"
-                        )
+                        logging.warning(github_repo + f": \"{branch}\" branch does not exist, skipping repo")
+                        skipped_repos.append(f"{github_repo}: missing branch {branch}")
                         skip = True
                         break
 
@@ -264,40 +175,30 @@ def release_notes():
                     continue
 
                 # Get commits
-                found_commits = repo.compare(
-                    compare_branches[1], compare_branches[0]).commits
-
-                # Parse commits
+                found_commits = repo.compare(compare_branches[1], compare_branches[0]).commits
                 commit_only = set()
                 prr_list = set()
-                pull_requests_from_commit = set()
+                # Fetch Pull Requests from commits
                 for found_commit in found_commits:
-                    # Get pull requests from commits
-                    if len(list(found_commit.get_pulls())) >= 1:
-                        pull_requests_from_commit.add(found_commit.get_pulls())
-
-                        for pr in pull_requests_from_commit:
-                            for prr in pr:
-                                prr_list.add(prr)
-                                continue
-
-                    # Save commits with no pull requests
+                    try:
+                        pr_list = found_commit.get_pulls()
+                        if pr_list:
+                            prr_list.update(list(pr_list))
+                    except Exception as e:
+                        logging.warning(f"Failed to retrieve pull requests for commit {found_commit.sha}: {e}")
+                        skipped_prs.append(f"Commit {found_commit.sha} in repo {github_repo} could not retrieve PRs")
                     else:
                         commit_url = found_commit.commit.html_url[:-34]
-                        commit_title = found_commit.commit.message.strip().split('\n', 1)[0] + " (Commit [" + found_commit.commit.sha[0:6]  + "](" + commit_url + "))"
+                        commit_title = "{} (Commit [{}])".format(found_commit.commit.message.strip().split('\n', 1)[0], found_commit.commit.sha[:6])
                         commit_only.add(commit_title)
-                        continue
-
-                # Get issues from pull requests
-                logging.info('Get issue info from pull request (PR)...')
                 issue_titles_bugs, issue_titles_enhancements, issue_titles_other = [], [], []
                 pull_requests_missing_issues = set()
+
+                # Check Jira keys and GitHub issues in PRs and fetch Epic details
                 if prr_list:
                     for pr in prr_list:
                         try:
-                            jira_keys, github_issues = get_issues_from_pr(repo, pr.number)
-                            
-                            # Handle Jira Epics
+                            jira_keys, github_issues = get_issues_from_pr(repo, pr.number)                           
                             if jira_keys:
                                 for jira_key in jira_keys:
                                     jira_issue = get_jira_issue(jira_key, args.jira_url, args.jira_email, args.jira_token)
@@ -312,19 +213,24 @@ def release_notes():
                             elif github_issues:
                                 issue_titles_bugs.extend(github_issues)
 
-                            # Fallback to PR description and title
+                            # Fallback to PR description and title at the end if no Issues are found.
                             else:
-                                pull_requests_missing_issues.add(pr.title.strip() + " (Pull Request [#" + str(pr.number) + "](" + pr.html_url + "))")
+                                pull_requests_missing_issues.add(pr.title.strip() + f" (Pull Request [#{pr.number}]({pr.html_url}))")
                         except Exception as e:
-                            logging.warning(f"Cannot get issue information for pull request {pr.number}: {e}")
+                            logging.error(f"Error processing PR #{pr.number} for repo {repo.name}: {e}")
+                            skipped_prs.append(f"PR #{pr.number} in repo {repo.name} failed to process")
                 else:
-                    logging.warning(github_repo + ": no pull requests found")
-
+                    logging.warning(f"No pull requests found for repo {repo.name}")
                 # Generate release notes for repo
                 release_notes += get_release_notes(repo.name, args.version, issue_titles_bugs, issue_titles_enhancements, issue_titles_other, commit_only, pull_requests_missing_issues)
-                logging.info('Generating release note for repos: ' + github_repo)
-                logging.info(release_notes)
-
+                logging.info('Generated release note for repo: ' + github_repo)
+        # write skipped repositories and PRs to the release notes
+        if skipped_repos:
+            release_notes += "\n\n### Skipped Repositories\n"
+            release_notes += "\n".join(skipped_repos)
+        if skipped_prs:
+            release_notes += "\n\n### Skipped Pull Requests\n"
+            release_notes += "\n".join(skipped_prs)
         # Write release notes to file
         pathlib.Path(args.output_file).unlink(missing_ok=True)
         with open(args.output_file, "w") as f:
@@ -355,5 +261,3 @@ if __name__ == "__main__":
         format="%(message)s",
         handlers=[logging.StreamHandler()],
     )
-
-    release_notes()
